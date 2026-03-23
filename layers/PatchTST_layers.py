@@ -1,4 +1,4 @@
-__all__ = ['Transpose', 'get_activation_fn', 'moving_avg', 'series_decomp', 'PositionalEncoding', 'SinCosPosEncoding', 'Coord2dPosEncoding', 'Coord1dPosEncoding', 'positional_encoding']           
+__all__ = ['Transpose', 'get_activation_fn', 'moving_avg', 'series_decomp', 'PositionalEncoding', 'SinCosPosEncoding', 'Coord2dPosEncoding', 'Coord1dPosEncoding', 'positional_encoding', 'ScalarProjectionEmbedding', 'RegimeEmbedding']           
 
 import torch
 from torch import nn
@@ -18,6 +18,40 @@ def get_activation_fn(activation):
     elif activation.lower() == "relu": return nn.ReLU()
     elif activation.lower() == "gelu": return nn.GELU()
     raise ValueError(f'{activation} is not available. You can use "relu", "gelu", or a callable') 
+
+
+class ScalarProjectionEmbedding(nn.Module):
+    """Project scalar token metadata (e.g. center/span) into d_model."""
+
+    def __init__(self, d_model, hidden_dim=32, dropout=0.0):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # x: [B, N, 1]
+        return self.proj(x)
+
+
+class RegimeEmbedding(nn.Module):
+    """Project regime statistics (e.g. [T_r, B_r, L_r]) into d_model."""
+
+    def __init__(self, regime_dim, d_model, hidden_dim=64, dropout=0.0):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(regime_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        # x: [B, N, regime_dim]
+        return self.proj(x)
     
     
 # decomposition

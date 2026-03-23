@@ -37,6 +37,16 @@ do
       --head_dropout 0\
       --patch_len 16\
       --stride 8\
+      --adaptive_patch 0\
+      --spec_window 32\
+      --spec_hop 8\
+      --pelt_penalty 1.0\
+      --patch_min 8\
+      --patch_max 64\
+      --patch_grid 2\
+      --anchor_len 16\
+      --patch_gen_alpha 1.0\
+      --patch_gen_beta 1.0\
       --des 'Exp' \
       --train_epochs 100\
       --patience 20\

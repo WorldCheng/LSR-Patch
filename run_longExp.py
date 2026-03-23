@@ -49,6 +49,16 @@ if __name__ == '__main__':
     parser.add_argument('--decomposition', type=int, default=0, help='decomposition; True 1 False 0')
     parser.add_argument('--kernel_size', type=int, default=25, help='decomposition-kernel')
     parser.add_argument('--individual', type=int, default=0, help='individual head; True 1 False 0')
+    parser.add_argument('--adaptive_patch', type=int, default=0, help='LSR-Patch adaptive patching; 0=fixed PatchTST, 1=adaptive')
+    parser.add_argument('--spec_window', type=int, default=32, help='local spectral window size for adaptive segmentation')
+    parser.add_argument('--spec_hop', type=int, default=8, help='local spectral hop size for adaptive segmentation')
+    parser.add_argument('--pelt_penalty', type=float, default=1.0, help='penalty coefficient for simplified PELT-style changepoint detection')
+    parser.add_argument('--patch_min', type=int, default=8, help='minimum adaptive patch length')
+    parser.add_argument('--patch_max', type=int, default=64, help='maximum adaptive patch length')
+    parser.add_argument('--patch_grid', type=int, default=2, help='grid size for adaptive patch length discretization')
+    parser.add_argument('--anchor_len', type=int, default=16, help='anchor length used to resize variable patches')
+    parser.add_argument('--patch_gen_alpha', type=float, default=1.0, help='alpha in p*=alpha*T_r/(1+beta*B_r)')
+    parser.add_argument('--patch_gen_beta', type=float, default=1.0, help='beta in p*=alpha*T_r/(1+beta*B_r)')
 
     # Formers 
     parser.add_argument('--embed_type', type=int, default=0, help='0: default 1: value embedding + temporal embedding + positional embedding 2: value embedding + temporal embedding 3: value embedding + positional embedding 4: value embedding')

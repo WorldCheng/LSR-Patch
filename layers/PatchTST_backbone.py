@@ -11,6 +11,7 @@ import numpy as np
 #from collections import OrderedDict
 from layers.PatchTST_layers import *
 from layers.RevIN import RevIN
+from layers.lsr_tokenizer import LocalSpectralTokenizer
 
 # Cell
 class PatchTST_backbone(nn.Module):
@@ -28,33 +29,89 @@ class PatchTST_backbone(nn.Module):
         self.revin = revin
         if self.revin: self.revin_layer = RevIN(c_in, affine=affine, subtract_last=subtract_last)
         
-        # Patching
-        self.patch_len = patch_len
-        self.stride = stride
-        self.padding_patch = padding_patch
-        patch_num = int((context_window - patch_len)/stride + 1)
-        if padding_patch == 'end': # can be modified to general case
-            self.padding_patch_layer = nn.ReplicationPad1d((0, stride)) 
-            patch_num += 1
-        
-        # Backbone 
-        self.backbone = TSTiEncoder(c_in, patch_num=patch_num, patch_len=patch_len, max_seq_len=max_seq_len,
-                                n_layers=n_layers, d_model=d_model, n_heads=n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff,
-                                attn_dropout=attn_dropout, dropout=dropout, act=act, key_padding_mask=key_padding_mask, padding_var=padding_var,
-                                attn_mask=attn_mask, res_attention=res_attention, pre_norm=pre_norm, store_attn=store_attn,
-                                pe=pe, learn_pe=learn_pe, verbose=verbose, **kwargs)
-
-        # Head
-        self.head_nf = d_model * patch_num
+        # Shared
         self.n_vars = c_in
-        self.pretrain_head = pretrain_head
-        self.head_type = head_type
-        self.individual = individual
+        self.adaptive_patch = bool(kwargs.get('adaptive_patch', 0))
 
-        if self.pretrain_head: 
-            self.head = self.create_pretrain_head(self.head_nf, c_in, fc_dropout) # custom head passed as a partial func with all its kwargs
-        elif head_type == 'flatten': 
-            self.head = Flatten_Head(self.individual, self.n_vars, self.head_nf, target_window, head_dropout=head_dropout)
+        if not self.adaptive_patch:
+            # Original fixed patching path (kept unchanged for backward compatibility).
+            self.patch_len = patch_len
+            self.stride = stride
+            self.padding_patch = padding_patch
+            patch_num = int((context_window - patch_len)/stride + 1)
+            if padding_patch == 'end': # can be modified to general case
+                self.padding_patch_layer = nn.ReplicationPad1d((0, stride)) 
+                patch_num += 1
+            
+            # Backbone 
+            self.backbone = TSTiEncoder(c_in, patch_num=patch_num, patch_len=patch_len, max_seq_len=max_seq_len,
+                                    n_layers=n_layers, d_model=d_model, n_heads=n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff,
+                                    attn_dropout=attn_dropout, dropout=dropout, act=act, key_padding_mask=key_padding_mask, padding_var=padding_var,
+                                    attn_mask=attn_mask, res_attention=res_attention, pre_norm=pre_norm, store_attn=store_attn,
+                                    pe=pe, learn_pe=learn_pe, verbose=verbose, **kwargs)
+
+            # Head
+            self.head_nf = d_model * patch_num
+            self.pretrain_head = pretrain_head
+            self.head_type = head_type
+            self.individual = individual
+
+            if self.pretrain_head: 
+                self.head = self.create_pretrain_head(self.head_nf, c_in, fc_dropout) # custom head passed as a partial func with all its kwargs
+            elif head_type == 'flatten': 
+                self.head = Flatten_Head(self.individual, self.n_vars, self.head_nf, target_window, head_dropout=head_dropout)
+        else:
+            # Adaptive patching path (LSR-Patch baseline).
+            self.patch_len = patch_len
+            self.stride = stride
+            self.padding_patch = padding_patch
+
+            self.tokenizer = LocalSpectralTokenizer(
+                spec_window=kwargs.get('spec_window', patch_len),
+                spec_hop=kwargs.get('spec_hop', stride),
+                pelt_penalty=kwargs.get('pelt_penalty', 1.0),
+                patch_min=kwargs.get('patch_min', max(2, patch_len // 2)),
+                patch_max=kwargs.get('patch_max', max(patch_len, patch_len * 4)),
+                patch_grid=kwargs.get('patch_grid', 1),
+                anchor_len=kwargs.get('anchor_len', patch_len),
+                patch_gen_alpha=kwargs.get('patch_gen_alpha', 1.0),
+                patch_gen_beta=kwargs.get('patch_gen_beta', 1.0),
+            )
+
+            self.adaptive_input_encoder = AdaptivePatchInputEncoder(
+                c_in=c_in,
+                anchor_len=self.tokenizer.anchor_len,
+                d_model=d_model,
+                dropout=dropout,
+            )
+            self.span_aware_embedding = SpanAwareEmbedding(
+                d_model=d_model,
+                regime_dim=self.tokenizer.regime_dim,
+                dropout=dropout,
+            )
+            # Reuse the existing Transformer encoder with key padding mask support.
+            self.adaptive_encoder = TSTEncoder(
+                max_seq_len,
+                d_model,
+                n_heads,
+                d_k=d_k,
+                d_v=d_v,
+                d_ff=d_ff,
+                norm=norm,
+                attn_dropout=attn_dropout,
+                dropout=dropout,
+                activation=act,
+                res_attention=res_attention,
+                n_layers=n_layers,
+                pre_norm=pre_norm,
+                store_attn=store_attn,
+            )
+            self.adaptive_head = AdaptiveForecastHead(
+                d_model=d_model,
+                n_vars=c_in,
+                target_window=target_window,
+                dropout=head_dropout,
+            )
         
     
     def forward(self, z):                                                                   # z: [bs x nvars x seq_len]
@@ -63,16 +120,35 @@ class PatchTST_backbone(nn.Module):
             z = z.permute(0,2,1)
             z = self.revin_layer(z, 'norm')
             z = z.permute(0,2,1)
+
+        if not self.adaptive_patch:
+            # Original fixed patching path.
+            if self.padding_patch == 'end':
+                z = self.padding_patch_layer(z)
+            z = z.unfold(dimension=-1, size=self.patch_len, step=self.stride)                   # z: [bs x nvars x patch_num x patch_len]
+            z = z.permute(0,1,3,2)                                                              # z: [bs x nvars x patch_len x patch_num]
             
-        # do patching
-        if self.padding_patch == 'end':
-            z = self.padding_patch_layer(z)
-        z = z.unfold(dimension=-1, size=self.patch_len, step=self.stride)                   # z: [bs x nvars x patch_num x patch_len]
-        z = z.permute(0,1,3,2)                                                              # z: [bs x nvars x patch_len x patch_num]
-        
-        # model
-        z = self.backbone(z)                                                                # z: [bs x nvars x d_model x patch_num]
-        z = self.head(z)                                                                    # z: [bs x nvars x target_window] 
+            # model
+            z = self.backbone(z)                                                                # z: [bs x nvars x d_model x patch_num]
+            z = self.head(z)                                                                    # z: [bs x nvars x target_window]
+        else:
+            # Adaptive mode shape contract:
+            # - tokenizer input: [B, C, L]
+            # - tokenizer patches: [B, N_max, C, anchor_len]
+            # - token mask: [B, N_max]
+            # - center/span: [B, N_max, 1]
+            # - regime: [B, N_max, regime_dim]
+            token_dict = self.tokenizer(z)
+            content = self.adaptive_input_encoder(token_dict["patches"])                         # [B, N_max, d_model]
+            content = self.span_aware_embedding(
+                content,
+                token_dict["center"],
+                token_dict["span"],
+                token_dict["regime"],
+            )                                                                                    # [B, N_max, d_model]
+            key_padding_mask = ~token_dict["token_mask"]                                         # True = pad
+            encoded = self.adaptive_encoder(content, key_padding_mask=key_padding_mask)          # [B, N_max, d_model]
+            z = self.adaptive_head(encoded, token_dict["token_mask"])                            # [B, C, target_window]
         
         # denorm
         if self.revin: 
@@ -121,6 +197,67 @@ class Flatten_Head(nn.Module):
             x = self.linear(x)
             x = self.dropout(x)
         return x
+        
+        
+class AdaptivePatchInputEncoder(nn.Module):
+    """
+    Lightweight shared content encoder for adaptive patches.
+    Input:  [B, N, C, anchor_len]
+    Output: [B, N, d_model]
+    """
+
+    def __init__(self, c_in, anchor_len, d_model, dropout=0.0):
+        super().__init__()
+        self.proj = nn.Linear(c_in * anchor_len, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, patches):
+        bsz, n_tokens, n_vars, anchor_len = patches.shape
+        x = patches.reshape(bsz, n_tokens, n_vars * anchor_len)
+        x = self.proj(x)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return x
+
+
+class SpanAwareEmbedding(nn.Module):
+    """
+    Adds span-aware metadata embeddings to content tokens.
+    """
+
+    def __init__(self, d_model, regime_dim, dropout=0.0):
+        super().__init__()
+        self.center_embed = ScalarProjectionEmbedding(d_model=d_model, dropout=dropout)
+        self.span_embed = ScalarProjectionEmbedding(d_model=d_model, dropout=dropout)
+        self.regime_embed = RegimeEmbedding(regime_dim=regime_dim, d_model=d_model, dropout=dropout)
+
+    def forward(self, content, center, span, regime):
+        # content: [B, N, d_model]
+        return content + self.center_embed(center) + self.span_embed(span) + self.regime_embed(regime)
+
+
+class AdaptiveForecastHead(nn.Module):
+    """
+    First baseline adaptive forecast head:
+    masked mean pooling over valid tokens, then linear projection.
+    """
+
+    def __init__(self, d_model, n_vars, target_window, dropout=0.0):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(d_model, n_vars * target_window)
+        self.n_vars = n_vars
+        self.target_window = target_window
+
+    def forward(self, encoded, token_mask):
+        # encoded: [B, N, d_model], token_mask: [B, N]
+        mask = token_mask.unsqueeze(-1).to(encoded.dtype)
+        denom = mask.sum(dim=1).clamp_min(1.0)
+        pooled = (encoded * mask).sum(dim=1) / denom
+        pooled = self.dropout(pooled)
+        out = self.proj(pooled)
+        return out.view(out.shape[0], self.n_vars, self.target_window)
         
         
     
@@ -376,4 +513,3 @@ class _ScaledDotProductAttention(nn.Module):
 
         if self.res_attention: return output, attn_weights, attn_scores
         else: return output, attn_weights
-
