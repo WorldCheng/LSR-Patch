@@ -57,12 +57,14 @@ class LocalSpectralTokenizer(nn.Module):
             agg = series.mean(dim=0)  # [L], used only for regime boundary detection
             boundaries = self._detect_boundaries(agg)
 
-            patch_list = []
-            start_list = []
-            end_list = []
-            center_list = []
-            span_list = []
-            regime_list = []
+            patch_chunks = []
+            start_chunks = []
+            end_chunks = []
+            center_chunks = []
+            span_chunks = []
+            regime_chunks = []
+            denom_center = float(max(total_len - 1, 1))
+            denom_span = float(max(total_len, 1))
 
             for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
                 if seg_end <= seg_start:
@@ -84,35 +86,57 @@ class LocalSpectralTokenizer(nn.Module):
                     device=device,
                 )
 
-                for start in range(seg_start, seg_end, patch_len):
-                    end = min(seg_end, start + patch_len)
-                    if end <= start:
-                        continue
-                    raw_patch = series[:, start:end]  # [C, patch_t]
-                    resized_patch = self._resize_patch(raw_patch)  # [C, anchor_len]
-                    patch_list.append(resized_patch)
-                    start_list.append(start)
-                    end_list.append(end)
+                # Fast path: batch process full-length patches for the segment.
+                seg_len_full = seg_end - seg_start
+                n_full = seg_len_full // patch_len
+                full_len = n_full * patch_len
+                if n_full > 0:
+                    full = series[:, seg_start : seg_start + full_len]  # [C, n_full * patch_len]
+                    full = full.reshape(n_vars, n_full, patch_len).permute(1, 0, 2).contiguous()  # [n_full, C, patch_len]
+                    if patch_len != self.anchor_len:
+                        full = F.interpolate(full, size=self.anchor_len, mode="linear", align_corners=False)
+                    patch_chunks.append(full)
 
-                    if total_len > 1:
-                        center_pos = ((start + end - 1) * 0.5) / float(total_len - 1)
-                    else:
-                        center_pos = 0.0
-                    span_ratio = (end - start) / float(max(total_len, 1))
-                    center_list.append(center_pos)
-                    span_list.append(span_ratio)
-                    regime_list.append(regime)
+                    starts = seg_start + torch.arange(n_full, device=device, dtype=torch.long) * patch_len
+                    ends = starts + patch_len
+                    start_chunks.append(starts)
+                    end_chunks.append(ends)
+
+                    center = ((starts.to(dtype) + ends.to(dtype) - 1.0) * 0.5 / denom_center).unsqueeze(-1)
+                    span = ((ends - starts).to(dtype) / denom_span).unsqueeze(-1)
+                    center_chunks.append(center)
+                    span_chunks.append(span)
+                    regime_chunks.append(regime.unsqueeze(0).expand(n_full, -1))
+
+                # Tail patch in the same segment (if the segment is not divisible by patch_len).
+                if full_len < seg_len_full:
+                    start = seg_start + full_len
+                    end = seg_end
+                    raw_patch = series[:, start:end]  # [C, patch_t]
+                    resized_patch = self._resize_patch(raw_patch).unsqueeze(0)  # [1, C, anchor_len]
+                    patch_chunks.append(resized_patch)
+
+                    start_t = torch.tensor([start], dtype=torch.long, device=device)
+                    end_t = torch.tensor([end], dtype=torch.long, device=device)
+                    start_chunks.append(start_t)
+                    end_chunks.append(end_t)
+
+                    center_t = ((start_t.to(dtype) + end_t.to(dtype) - 1.0) * 0.5 / denom_center).unsqueeze(-1)
+                    span_t = ((end_t - start_t).to(dtype) / denom_span).unsqueeze(-1)
+                    center_chunks.append(center_t)
+                    span_chunks.append(span_t)
+                    regime_chunks.append(regime.unsqueeze(0))
 
             # Defensive fallback: always emit at least one token.
-            if len(patch_list) == 0:
+            if len(patch_chunks) == 0:
                 resized_patch = self._resize_patch(series)
-                patch_list.append(resized_patch)
-                start_list.append(0)
-                end_list.append(total_len)
-                center_list.append(0.5 if total_len > 1 else 0.0)
-                span_list.append(1.0)
+                patch_chunks.append(resized_patch.unsqueeze(0))
+                start_chunks.append(torch.tensor([0], dtype=torch.long, device=device))
+                end_chunks.append(torch.tensor([total_len], dtype=torch.long, device=device))
+                center_chunks.append(torch.tensor([[0.5 if total_len > 1 else 0.0]], dtype=dtype, device=device))
+                span_chunks.append(torch.tensor([[1.0]], dtype=dtype, device=device))
                 dom_period, bandwidth = self._segment_stats(agg)
-                regime_list.append(
+                regime_chunks.append(
                     torch.tensor(
                         [
                             dom_period / float(max(total_len, 1)),
@@ -121,15 +145,15 @@ class LocalSpectralTokenizer(nn.Module):
                         ],
                         dtype=dtype,
                         device=device,
-                    )
+                    ).unsqueeze(0)
                 )
 
-            patches = torch.stack(patch_list, dim=0)  # [N_i, C, anchor_len]
-            start = torch.tensor(start_list, dtype=torch.long, device=device)  # [N_i]
-            end = torch.tensor(end_list, dtype=torch.long, device=device)  # [N_i]
-            center = torch.tensor(center_list, dtype=dtype, device=device).unsqueeze(-1)  # [N_i, 1]
-            span = torch.tensor(span_list, dtype=dtype, device=device).unsqueeze(-1)  # [N_i, 1]
-            regime = torch.stack(regime_list, dim=0)  # [N_i, regime_dim]
+            patches = torch.cat(patch_chunks, dim=0)  # [N_i, C, anchor_len]
+            start = torch.cat(start_chunks, dim=0)  # [N_i]
+            end = torch.cat(end_chunks, dim=0)  # [N_i]
+            center = torch.cat(center_chunks, dim=0)  # [N_i, 1]
+            span = torch.cat(span_chunks, dim=0)  # [N_i, 1]
+            regime = torch.cat(regime_chunks, dim=0)  # [N_i, regime_dim]
             n_tokens = patches.shape[0]
 
             sample_tokens.append((patches, start, end, center, span, regime, n_tokens))
@@ -213,52 +237,59 @@ class LocalSpectralTokenizer(nn.Module):
 
         if total_len <= window:
             starts = [0]
+            windows = signal_1d.unsqueeze(0)
         else:
             starts = list(range(0, total_len - window + 1, hop))
+            windows = signal_1d.unfold(0, window, hop)
             if starts[-1] != total_len - window:
                 starts.append(total_len - window)
+                windows = torch.cat([windows, signal_1d[-window:].unsqueeze(0)], dim=0)
 
-        feats = []
-        for start in starts:
-            seg = signal_1d[start : start + window]
-            feat, _, _ = self._spectral_signature(seg)
-            feats.append(feat)
-        feat_seq = torch.stack(feats, dim=0)  # [W, D]
+        feat_seq, _, _ = self._spectral_signature_batch(windows)  # [W, D]
         return feat_seq, starts
 
     def _spectral_signature(self, segment: torch.Tensor):
-        length = int(segment.shape[0])
-        dtype = segment.dtype
-        device = segment.device
+        feat, dom_period, bandwidth = self._spectral_signature_batch(segment.unsqueeze(0))
+        return feat[0], float(dom_period[0].item()), float(bandwidth[0].item())
+
+    def _spectral_signature_batch(self, segments: torch.Tensor):
+        # segments: [N, L]
+        n_seg, length = segments.shape
+        length = int(length)
+        dtype = segments.dtype
+        device = segments.device
 
         if length < 2:
-            zero = torch.zeros(1, dtype=dtype, device=device).squeeze(0)
-            feat = torch.stack([zero, zero, zero], dim=0)
-            return feat, 1.0, 0.0
+            zero = torch.zeros((n_seg,), dtype=dtype, device=device)
+            feat = torch.stack([zero, zero, zero], dim=-1)
+            dom_period = torch.ones((n_seg,), dtype=dtype, device=device)
+            bandwidth = torch.zeros((n_seg,), dtype=dtype, device=device)
+            return feat, dom_period, bandwidth
 
-        spec = torch.fft.rfft(segment, dim=-1)
+        spec = torch.fft.rfft(segments, dim=-1)
         power = spec.abs().pow(2)
-        if power.numel() <= 1:
-            zero = torch.zeros(1, dtype=dtype, device=device).squeeze(0)
-            feat = torch.stack([zero, zero, zero], dim=0)
-            return feat, float(length), 0.0
+        if power.shape[-1] <= 1:
+            zero = torch.zeros((n_seg,), dtype=dtype, device=device)
+            feat = torch.stack([zero, zero, zero], dim=-1)
+            dom_period = torch.full((n_seg,), float(length), dtype=dtype, device=device)
+            bandwidth = torch.zeros((n_seg,), dtype=dtype, device=device)
+            return feat, dom_period, bandwidth
 
-        power = power[1:]  # remove DC component
-        total_power = power.sum().clamp_min(1e-8)
+        power = power[..., 1:]  # remove DC component
+        total_power = power.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
-        dom_idx = int(torch.argmax(power).item()) + 1
-        dom_period = float(length) / float(max(dom_idx, 1))
+        dom_idx = power.argmax(dim=-1) + 1  # [N]
+        dom_period = float(length) / dom_idx.to(dtype).clamp_min(1.0)
 
-        freq_idx = torch.arange(1, power.shape[0] + 1, dtype=dtype, device=device)
-        centroid = (power * freq_idx).sum() / total_power
-        variance = ((freq_idx - centroid) ** 2 * power).sum() / total_power
-        bandwidth = torch.sqrt(torch.clamp(variance, min=0.0)) / float(max(length, 1))
-        bandwidth_val = float(bandwidth.item())
+        freq_idx = torch.arange(1, power.shape[-1] + 1, dtype=dtype, device=device).unsqueeze(0)  # [1, F]
+        centroid = (power * freq_idx).sum(dim=-1, keepdim=True) / total_power
+        variance = ((freq_idx - centroid) ** 2 * power).sum(dim=-1, keepdim=True) / total_power
+        bandwidth = torch.sqrt(torch.clamp(variance, min=0.0)).squeeze(-1) / float(max(length, 1))
 
         # Low-dimensional feature vector for changepoint detection.
-        dom_freq = torch.tensor(float(dom_idx) / float(max(length, 1)), dtype=dtype, device=device)
-        feat = torch.stack([dom_freq, bandwidth, torch.log1p(power.mean())], dim=0)
-        return feat, dom_period, bandwidth_val
+        dom_freq = dom_idx.to(dtype) / float(max(length, 1))
+        feat = torch.stack([dom_freq, bandwidth, torch.log1p(power.mean(dim=-1))], dim=-1)
+        return feat, dom_period, bandwidth
 
     def _penalized_dp_changepoints(self, feat_seq: torch.Tensor):
         """
@@ -278,29 +309,24 @@ class LocalSpectralTokenizer(nn.Module):
             dim=0,
         )
 
-        def segment_cost(start: int, end: int):
-            seg_len = max(end - start, 1)
-            seg_sum = prefix[end] - prefix[start]
-            seg_sq = prefix_sq[end] - prefix_sq[start]
-            # SSE around segment-wise mean in feature space.
-            sse = (seg_sq - (seg_sum ** 2) / float(seg_len)).sum()
-            return sse
-
         dp = feat_seq.new_full((n_steps + 1,), float("inf"))
         prev = torch.full((n_steps + 1,), -1, dtype=torch.long, device=feat_seq.device)
+        idx = torch.arange(n_steps + 1, device=feat_seq.device, dtype=torch.long)
 
         # Offset so penalty is paid only for actual changepoints.
         dp[0] = -self.pelt_penalty
         for end in range(1, n_steps + 1):
-            best_val = None
-            best_start = 0
-            for start in range(0, end):
-                val = dp[start] + segment_cost(start, end) + self.pelt_penalty
-                if best_val is None or val < best_val:
-                    best_val = val
-                    best_start = start
-            dp[end] = best_val
-            prev[end] = best_start
+            starts = idx[:end]  # [end]
+            seg_len = (end - starts).to(feat_seq.dtype).unsqueeze(-1)  # [end, 1]
+            seg_sum = prefix[end].unsqueeze(0) - prefix[starts]  # [end, D]
+            seg_sq = prefix_sq[end].unsqueeze(0) - prefix_sq[starts]  # [end, D]
+            # SSE around segment-wise mean in feature space.
+            sse = (seg_sq - (seg_sum ** 2) / seg_len).sum(dim=-1)  # [end]
+            vals = dp[starts] + sse + self.pelt_penalty  # [end]
+
+            best_idx = torch.argmin(vals)
+            dp[end] = vals[best_idx]
+            prev[end] = starts[best_idx]
 
         boundaries = [n_steps]
         cur = n_steps
