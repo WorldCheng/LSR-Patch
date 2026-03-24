@@ -14,8 +14,6 @@ model_id_name=weather
 data_name=custom
 
 random_seed=2021
-# Device switch: 1 for Apple Silicon MPS, 0 for default CUDA/CPU logic.
-use_mps=0
 for pred_len in 96 192 336 720
 do
     python -u run_longExp.py \
@@ -49,7 +47,6 @@ do
       --anchor_len 16\
       --patch_gen_alpha 1.0\
       --patch_gen_beta 1.0\
-      --use_mps $use_mps\
       --des 'Exp' \
       --train_epochs 100\
       --patience 20\

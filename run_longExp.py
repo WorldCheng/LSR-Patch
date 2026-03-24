@@ -108,8 +108,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
     # Device
-    parser.add_argument('--use_gpu', type=str2bool, default=True, help='use CUDA gpu')
-    parser.add_argument('--use_mps', type=str2bool, default=False, help='use Apple MPS device')
+    parser.add_argument('--use_gpu', type=str2bool, default=True, help='use accelerator; prefer CUDA, fallback to MPS')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
     parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
     parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
@@ -124,23 +123,28 @@ if __name__ == '__main__':
     np.random.seed(fix_seed)
 
 
+    cuda_available = torch.cuda.is_available()
     mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-    if args.use_mps and not mps_available:
-        print('MPS requested but not available, fallback to CUDA/CPU.')
-
-    if args.use_mps and mps_available:
-        args.use_gpu = False
-        args.use_multi_gpu = False
+    if args.use_gpu:
+        if cuda_available:
+            pass
+        elif mps_available:
+            args.use_multi_gpu = False
+            print('CUDA not available, fallback to MPS.')
+        else:
+            args.use_gpu = False
+            args.use_multi_gpu = False
+            print('No CUDA/MPS available, fallback to CPU.')
     else:
-        args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
+        args.use_multi_gpu = False
 
     # torch.cuda.amp is CUDA-only in this codebase.
-    if args.use_amp and not args.use_gpu:
+    if args.use_amp and not (args.use_gpu and cuda_available):
         print('use_amp requires CUDA in this project, disable use_amp on current device.')
         args.use_amp = False
 
-    if args.use_gpu and args.use_multi_gpu:
-        args.dvices = args.devices.replace(' ', '')
+    if args.use_gpu and cuda_available and args.use_multi_gpu:
+        args.devices = args.devices.replace(' ', '')
         device_ids = args.devices.split(',')
         args.device_ids = [int(id_) for id_ in device_ids]
         args.gpu = args.device_ids[0]
