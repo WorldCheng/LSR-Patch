@@ -5,6 +5,18 @@ from exp.exp_main import Exp_Main
 import random
 import numpy as np
 
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in ('1', 'true', 't', 'yes', 'y'):
+        return True
+    if value in ('0', 'false', 'f', 'no', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected (true/false or 1/0).')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Autoformer & Transformer family for Time Series Forecasting')
 
@@ -95,8 +107,9 @@ if __name__ == '__main__':
     parser.add_argument('--pct_start', type=float, default=0.3, help='pct_start')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
-    # GPU
-    parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
+    # Device
+    parser.add_argument('--use_gpu', type=str2bool, default=True, help='use CUDA gpu')
+    parser.add_argument('--use_mps', type=str2bool, default=False, help='use Apple MPS device')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
     parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=False)
     parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
@@ -111,7 +124,20 @@ if __name__ == '__main__':
     np.random.seed(fix_seed)
 
 
-    args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
+    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+    if args.use_mps and not mps_available:
+        print('MPS requested but not available, fallback to CUDA/CPU.')
+
+    if args.use_mps and mps_available:
+        args.use_gpu = False
+        args.use_multi_gpu = False
+    else:
+        args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
+
+    # torch.cuda.amp is CUDA-only in this codebase.
+    if args.use_amp and not args.use_gpu:
+        print('use_amp requires CUDA in this project, disable use_amp on current device.')
+        args.use_amp = False
 
     if args.use_gpu and args.use_multi_gpu:
         args.dvices = args.devices.replace(' ', '')
@@ -156,7 +182,8 @@ if __name__ == '__main__':
                 print('>>>>>>>predicting : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
                 exp.predict(setting, True)
 
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     else:
         ii = 0
         setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_{}'.format(args.model_id,
@@ -179,5 +206,6 @@ if __name__ == '__main__':
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
         exp.test(setting, test=1)
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         

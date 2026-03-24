@@ -5,7 +5,7 @@ fi
 if [ ! -d "./logs/LongForecasting" ]; then
     mkdir ./logs/LongForecasting
 fi
-seq_len=512
+seq_len=336
 model_name=PatchTST
 
 root_path_name=./dataset/
@@ -14,6 +14,8 @@ model_id_name=ETTh1
 data_name=ETTh1
 
 random_seed=2021
+# Device switch: 1 for Apple Silicon MPS, 0 for default CUDA/CPU logic.
+use_mps=1
 for pred_len in 96 192 336 720
 do
     python -u run_longExp.py \
@@ -39,7 +41,7 @@ do
       --stride 8\
       --adaptive_patch 0\
       --spec_window 32\
-      --spec_hop 8\
+      --spec_hop 16\
       --pelt_penalty 1.0\
       --patch_min 8\
       --patch_max 64\
@@ -47,6 +49,7 @@ do
       --anchor_len 16\
       --patch_gen_alpha 1.0\
       --patch_gen_beta 1.0\
+      --use_mps $use_mps\
       --des 'Exp' \
       --train_epochs 100\
       --itr 1 --batch_size 128 --learning_rate 0.0001 >logs/LongForecasting/$model_name'_'$model_id_name'_'$seq_len'_'$pred_len.log 
