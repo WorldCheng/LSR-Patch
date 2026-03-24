@@ -64,7 +64,7 @@ if __name__ == '__main__':
     parser.add_argument('--adaptive_patch', type=int, default=0, help='LSR-Patch adaptive patching; 0=fixed PatchTST, 1=adaptive')
     parser.add_argument('--spec_window', type=int, default=32, help='local spectral window size for adaptive segmentation')
     parser.add_argument('--spec_hop', type=int, default=8, help='local spectral hop size for adaptive segmentation')
-    parser.add_argument('--pelt_penalty', type=float, default=1.0, help='penalty coefficient for simplified PELT-style changepoint detection')
+    parser.add_argument('--pelt_penalty', type=float, default=1.0, help='penalty coefficient for PELT-pruned changepoint detection')
     parser.add_argument('--patch_min', type=int, default=8, help='minimum adaptive patch length')
     parser.add_argument('--patch_max', type=int, default=64, help='maximum adaptive patch length')
     parser.add_argument('--patch_grid', type=int, default=2, help='grid size for adaptive patch length discretization')

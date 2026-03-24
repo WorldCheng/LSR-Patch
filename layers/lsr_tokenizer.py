@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from collections import OrderedDict
+import hashlib
 
 
 class LocalSpectralTokenizer(nn.Module):
@@ -43,6 +45,10 @@ class LocalSpectralTokenizer(nn.Module):
         self.patch_gen_alpha = float(patch_gen_alpha)
         self.patch_gen_beta = float(patch_gen_beta)
         self.regime_dim = 3
+        # Small LRU cache for CPU-side segmentation plans:
+        # key -> tuple[(start, end, patch_len, dom_period, bandwidth), ...]
+        self._seg_cache = OrderedDict()
+        self._seg_cache_size = 4096
 
     def forward(self, x: torch.Tensor):
         # x: [B, C, L]
@@ -55,7 +61,7 @@ class LocalSpectralTokenizer(nn.Module):
         for b in range(bsz):
             series = x[b]  # [C, L]
             agg = series.mean(dim=0)  # [L], used only for regime boundary detection
-            boundaries = self._detect_boundaries(agg)
+            segment_plan = self._build_segment_plan(agg)
 
             patch_chunks = []
             start_chunks = []
@@ -66,14 +72,11 @@ class LocalSpectralTokenizer(nn.Module):
             denom_center = float(max(total_len - 1, 1))
             denom_span = float(max(total_len, 1))
 
-            for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+            for seg_start, seg_end, patch_len, dom_period, bandwidth in segment_plan:
                 if seg_end <= seg_start:
                     continue
 
-                seg_signal = agg[seg_start:seg_end]
-                dom_period, bandwidth = self._segment_stats(seg_signal)
                 seg_len = seg_end - seg_start
-                patch_len = self._generate_patch_length(dom_period, bandwidth, seg_len)
 
                 seg_ratio = float(seg_len) / float(max(total_len, 1))
                 regime = torch.tensor(
@@ -135,7 +138,10 @@ class LocalSpectralTokenizer(nn.Module):
                 end_chunks.append(torch.tensor([total_len], dtype=torch.long, device=device))
                 center_chunks.append(torch.tensor([[0.5 if total_len > 1 else 0.0]], dtype=dtype, device=device))
                 span_chunks.append(torch.tensor([[1.0]], dtype=dtype, device=device))
-                dom_period, bandwidth = self._segment_stats(agg)
+                if len(segment_plan) > 0:
+                    _, _, _, dom_period, bandwidth = segment_plan[0]
+                else:
+                    dom_period, bandwidth = float(total_len), 0.0
                 regime_chunks.append(
                     torch.tensor(
                         [
@@ -201,6 +207,61 @@ class LocalSpectralTokenizer(nn.Module):
             align_corners=False,
         ).squeeze(0)
 
+    @torch.no_grad()
+    def _build_segment_plan(self, signal_1d: torch.Tensor):
+        """
+        Build or reuse a cached segmentation plan for one aggregated series.
+
+        Input:
+        - signal_1d: [L] (device can be CPU/GPU)
+
+        Output:
+        - list of tuples (start, end, patch_len, dom_period, bandwidth)
+          with strictly increasing [start, end) segments that cover [0, L].
+        """
+        signal_cpu = signal_1d.detach().to(device=torch.device("cpu"), dtype=torch.float32).contiguous()
+        cache_key = self._series_cache_key(signal_cpu)
+        cached = self._seg_cache.get(cache_key)
+        if cached is not None:
+            self._seg_cache.move_to_end(cache_key)
+            return list(cached)
+
+        plan = self._build_segment_plan_uncached(signal_cpu)
+        if self._seg_cache_size > 0:
+            self._seg_cache[cache_key] = tuple(plan)
+            self._seg_cache.move_to_end(cache_key)
+            if len(self._seg_cache) > self._seg_cache_size:
+                self._seg_cache.popitem(last=False)
+        return plan
+
+    def _series_cache_key(self, signal_1d_cpu: torch.Tensor) -> str:
+        payload = signal_1d_cpu.numpy().tobytes()
+        digest = hashlib.blake2b(payload, digest_size=16).hexdigest()
+        return f"{signal_1d_cpu.numel()}:{digest}"
+
+    def _build_segment_plan_uncached(self, signal_1d_cpu: torch.Tensor):
+        total_len = int(signal_1d_cpu.shape[0])
+        if total_len <= 0:
+            return [(0, 0, 1, 1.0, 0.0)]
+
+        boundaries = self._detect_boundaries(signal_1d_cpu)
+        plan = []
+        for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+            if seg_end <= seg_start:
+                continue
+            seg_signal = signal_1d_cpu[seg_start:seg_end]
+            dom_period, bandwidth = self._segment_stats(seg_signal)
+            seg_len = int(seg_end - seg_start)
+            patch_len = self._generate_patch_length(dom_period, bandwidth, seg_len)
+            plan.append((int(seg_start), int(seg_end), int(patch_len), float(dom_period), float(bandwidth)))
+
+        if len(plan) == 0:
+            dom_period, bandwidth = self._segment_stats(signal_1d_cpu)
+            patch_len = self._generate_patch_length(dom_period, bandwidth, total_len)
+            plan = [(0, total_len, int(patch_len), float(dom_period), float(bandwidth))]
+
+        return plan
+
     def _detect_boundaries(self, signal_1d: torch.Tensor):
         total_len = signal_1d.shape[0]
         if total_len <= max(2, self.patch_min):
@@ -214,23 +275,30 @@ class LocalSpectralTokenizer(nn.Module):
         window_boundaries = self._penalized_dp_changepoints(feat_seq)
 
         # Convert window-index boundaries into time-index boundaries.
-        boundaries = [0]
+        candidate_boundaries = []
         for w_idx in window_boundaries[1:-1]:
             if w_idx < 0 or w_idx >= len(win_starts):
                 continue
             t_idx = int(win_starts[w_idx])
+            candidate_boundaries.append(t_idx)
+
+        boundaries = [0]
+        for t_idx in sorted(set(candidate_boundaries)):
             if t_idx <= boundaries[-1]:
                 continue
-            # Keep practical segment lengths for this first baseline implementation.
             if t_idx - boundaries[-1] < self.patch_min:
                 continue
             if total_len - t_idx < self.patch_min:
                 continue
             boundaries.append(t_idx)
-        boundaries.append(total_len)
+        if boundaries[-1] != total_len:
+            boundaries.append(total_len)
+        if len(boundaries) == 1:
+            boundaries = [0, total_len]
         return boundaries
 
     def _local_spectral_features(self, signal_1d: torch.Tensor):
+        # signal_1d: [L] on CPU. Returns feat_seq [W, D] and window start indices.
         total_len = signal_1d.shape[0]
         window = min(self.spec_window, total_len)
         hop = self.spec_hop
@@ -291,10 +359,49 @@ class LocalSpectralTokenizer(nn.Module):
         feat = torch.stack([dom_freq, bandwidth, torch.log1p(power.mean(dim=-1))], dim=-1)
         return feat, dom_period, bandwidth
 
+    def _segment_sse_cost_from_prefix(
+        self,
+        prefix: torch.Tensor,
+        prefix_sq: torch.Tensor,
+        starts: torch.Tensor,
+        end: int,
+    ) -> torch.Tensor:
+        """
+        O(1) segment SSE query from cumulative sums.
+
+        Inputs:
+        - prefix/prefix_sq: [W+1, D]
+        - starts: [K] candidate start indices tau in (tau, end]
+        - end: scalar segment end index
+
+        Output:
+        - cost: [K], C(tau+1:end) with multivariate within-segment SSE in feature space.
+        """
+        dtype = prefix.dtype
+        seg_len = (end - starts).to(dtype=dtype).unsqueeze(-1)  # [K, 1]
+        seg_sum = prefix[end].unsqueeze(0) - prefix.index_select(0, starts)  # [K, D]
+        seg_sq = prefix_sq[end].unsqueeze(0) - prefix_sq.index_select(0, starts)  # [K, D]
+        sse = (seg_sq - (seg_sum ** 2) / seg_len).sum(dim=-1)  # [K]
+        return torch.clamp(sse, min=0.0)
+
     def _penalized_dp_changepoints(self, feat_seq: torch.Tensor):
         """
-        Penalty-based dynamic programming segmentation over local spectral features.
-        This is a simplified PELT-style offline detector (O(W^2)) for the first baseline.
+        True PELT (Pruned Exact Linear Time) over local spectral feature windows.
+
+        Recurrence:
+            F(t) = min_{tau < t} [F(tau) + C(tau+1:t) + beta]
+
+        where C is segment SSE around the segment mean in feature space.
+
+        Candidate pruning:
+        - Maintain an active candidate set R.
+        - After solving F(t), prune tau in R when
+              F(tau) + C(tau+1:t) > F(t)
+          (SSE cost satisfies PELT's additivity condition with K=0).
+
+        Shapes:
+        - feat_seq: [W, D]
+        - returns sorted boundary indices in [0, W], including 0 and W.
         """
         n_steps, feat_dim = feat_seq.shape
         if n_steps <= 1:
@@ -311,27 +418,33 @@ class LocalSpectralTokenizer(nn.Module):
 
         dp = feat_seq.new_full((n_steps + 1,), float("inf"))
         prev = torch.full((n_steps + 1,), -1, dtype=torch.long, device=feat_seq.device)
-        idx = torch.arange(n_steps + 1, device=feat_seq.device, dtype=torch.long)
+        candidates = torch.zeros((1,), dtype=torch.long, device=feat_seq.device)  # R_1 = {0}
 
         # Offset so penalty is paid only for actual changepoints.
         dp[0] = -self.pelt_penalty
         for end in range(1, n_steps + 1):
-            starts = idx[:end]  # [end]
-            seg_len = (end - starts).to(feat_seq.dtype).unsqueeze(-1)  # [end, 1]
-            seg_sum = prefix[end].unsqueeze(0) - prefix[starts]  # [end, D]
-            seg_sq = prefix_sq[end].unsqueeze(0) - prefix_sq[starts]  # [end, D]
-            # SSE around segment-wise mean in feature space.
-            sse = (seg_sq - (seg_sum ** 2) / seg_len).sum(dim=-1)  # [end]
-            vals = dp[starts] + sse + self.pelt_penalty  # [end]
+            # Evaluate only active candidates in R_t.
+            sse = self._segment_sse_cost_from_prefix(prefix, prefix_sq, candidates, end)  # [|R_t|]
+            vals = dp[candidates] + sse + self.pelt_penalty  # [|R_t|]
 
-            best_idx = torch.argmin(vals)
+            best_idx = int(torch.argmin(vals).item())
+            best_start = candidates[best_idx]
             dp[end] = vals[best_idx]
-            prev[end] = starts[best_idx]
+            prev[end] = best_start
+
+            # PELT pruning: keep tau where F(tau) + C(tau+1:end) <= F(end), then add end.
+            keep_mask = (dp[candidates] + sse) <= dp[end]
+            kept = candidates[keep_mask]
+            end_tensor = torch.tensor([end], dtype=torch.long, device=feat_seq.device)
+            candidates = torch.cat([kept, end_tensor], dim=0)
 
         boundaries = [n_steps]
         cur = n_steps
         while cur > 0:
-            cur = int(prev[cur].item())
+            next_cur = int(prev[cur].item())
+            if next_cur < 0:
+                break
+            cur = next_cur
             boundaries.append(cur)
             if cur == 0:
                 break
